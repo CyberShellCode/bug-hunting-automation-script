@@ -5,6 +5,7 @@
 # Combines: Wayback, Shodan, Nuclei, Arjun,
 # Dalfox, Loxs, GF Patterns, and more
 # Author: Enhanced by coffinxp methodology
+# Version: 2.1 - Optimized workflow
 #############################################
 
 # Color codes
@@ -20,7 +21,7 @@ NC='\033[0m' # No Color
 echo -e "${PURPLE}"
 cat << "EOF"
 ╔══════════════════════════════════════════════════════════╗
-║   MASTER BUG BOUNTY AUTOMATION FRAMEWORK v2.0           ║
+║   MASTER BUG BOUNTY AUTOMATION FRAMEWORK v2.1           ║
 ║   Wayback + Shodan + Nuclei + XSS + IDOR + SQLi         ║
 ╚══════════════════════════════════════════════════════════╝
 EOF
@@ -33,6 +34,7 @@ SHODAN_API_KEY="${SHODAN_API_KEY:-}"  # Set via env variable
 VT_API_KEY="${VT_API_KEY:-}"          # VirusTotal API key
 THREADS=20
 RATE_LIMIT=50
+MAX_FILES_TO_CHECK=500  # Configurable limit for file accessibility checks
 
 # Usage check
 if [ -z "$DOMAINS_FILE" ] || [ ! -f "$DOMAINS_FILE" ]; then
@@ -69,9 +71,40 @@ print_info() {
 }
 
 #############################################
-# PHASE 1: WAYBACK MACHINE RECONNAISSANCE
+# PHASE 1: SUBDOMAIN ENUMERATION
 #############################################
-print_status "PHASE 1: Wayback Machine URL Extraction"
+print_status "PHASE 1: Subdomain Enumeration"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+subdomain_enum() {
+    local domain=$1
+    print_info "Enumerating subdomains for $domain..."
+    
+    # Multiple sources
+    subfinder -d "$domain" -silent -all >> "$OUTPUT_DIR/subdomains_raw.txt" 2>/dev/null
+    assetfinder --subs-only "$domain" >> "$OUTPUT_DIR/subdomains_raw.txt" 2>/dev/null
+}
+
+while IFS= read -r domain; do
+    # Strip protocol if present
+    clean_domain=$(echo "$domain" | sed 's|https\?://||' | cut -d'/' -f1)
+    subdomain_enum "$clean_domain" &
+done < "$DOMAINS_FILE"
+wait
+
+# Add input domains to subdomain list
+cat "$DOMAINS_FILE" | sed 's|https\?://||' | cut -d'/' -f1 >> "$OUTPUT_DIR/subdomains_raw.txt"
+
+# Deduplicate subdomains
+sort -u "$OUTPUT_DIR/subdomains_raw.txt" > "$OUTPUT_DIR/all_subdomains.txt"
+rm "$OUTPUT_DIR/subdomains_raw.txt" 2>/dev/null
+
+print_success "Total subdomains (including input): $(wc -l < $OUTPUT_DIR/all_subdomains.txt)"
+
+#############################################
+# PHASE 2: WAYBACK MACHINE RECONNAISSANCE
+#############################################
+print_status "\nPHASE 2: Wayback Machine URL Extraction"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 wayback_extract() {
@@ -97,10 +130,16 @@ wayback_extract() {
     print_success "Found $count URLs for $domain"
 }
 
-# Extract wayback URLs for all domains
+# Extract wayback URLs for ALL discovered subdomains (including dead ones)
+print_info "Running Wayback extraction on all discovered subdomains..."
 while IFS= read -r domain; do
     wayback_extract "$domain" &
-done < "$DOMAINS_FILE"
+    
+    # Limit concurrent jobs
+    if [[ $(jobs -r -p | wc -l) -ge $THREADS ]]; then
+        wait -n
+    fi
+done < "$OUTPUT_DIR/all_subdomains.txt"
 wait
 
 # Combine all wayback URLs
@@ -108,9 +147,20 @@ cat "$OUTPUT_DIR"/wayback/*.txt 2>/dev/null | sort -u > "$OUTPUT_DIR/wayback/all
 print_success "Total unique Wayback URLs: $(wc -l < $OUTPUT_DIR/wayback/all_wayback_urls.txt)"
 
 #############################################
-# PHASE 2: SENSITIVE FILE DISCOVERY
+# PHASE 3: ALIVE SUBDOMAIN CHECK
 #############################################
-print_status "\nPHASE 2: Sensitive File Discovery"
+print_status "\nPHASE 3: Checking Alive Subdomains"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+print_info "Filtering alive subdomains with httpx..."
+cat "$OUTPUT_DIR/all_subdomains.txt" | httpx -silent -threads $THREADS -mc 200,301,302,403 -o "$OUTPUT_DIR/alive_subdomains.txt"
+
+print_success "Alive subdomains: $(wc -l < $OUTPUT_DIR/alive_subdomains.txt) / $(wc -l < $OUTPUT_DIR/all_subdomains.txt)"
+
+#############################################
+# PHASE 4: SENSITIVE FILE DISCOVERY
+#############################################
+print_status "\nPHASE 4: Sensitive File Discovery"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 print_info "Filtering sensitive file extensions..."
@@ -131,7 +181,7 @@ print_success "Archives: $(wc -l < $OUTPUT_DIR/secrets/archives.txt)"
 print_success "Configs: $(wc -l < $OUTPUT_DIR/secrets/config_files.txt)"
 
 # Check if files are accessible (404 technique)
-print_info "Checking file accessibility (this may take a while)..."
+print_info "Checking file accessibility (max $MAX_FILES_TO_CHECK files)..."
 
 check_file_status() {
     local url=$1
@@ -148,8 +198,8 @@ check_file_status() {
     fi
 }
 
-# Check first 100 sensitive files (adjust as needed)
-head -100 "$OUTPUT_DIR/secrets/sensitive_files.txt" | while read -r url; do
+# Check files with configurable limit
+head -"$MAX_FILES_TO_CHECK" "$OUTPUT_DIR/secrets/sensitive_files.txt" | while read -r url; do
     check_file_status "$url" &
     # Limit concurrent connections
     if [[ $(jobs -r -p | wc -l) -ge $THREADS ]]; then
@@ -163,45 +213,10 @@ print_info "404 files to check in Wayback: $(wc -l < $OUTPUT_DIR/secrets/404_che
 print_info "Accessible files: $(wc -l < $OUTPUT_DIR/secrets/accessible_files.txt 2>/dev/null || echo 0)"
 
 #############################################
-# PHASE 3: SUBDOMAIN ENUMERATION
-#############################################
-print_status "\nPHASE 3: Subdomain Enumeration"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-subdomain_enum() {
-    local domain=$1
-    print_info "Enumerating subdomains for $domain..."
-    
-    # Multiple sources
-    subfinder -d "$domain" -silent -all >> "$OUTPUT_DIR/subdomains_raw.txt" 2>/dev/null
-    assetfinder --subs-only "$domain" >> "$OUTPUT_DIR/subdomains_raw.txt" 2>/dev/null
-    
-    # Extract from Wayback URLs
-    cat "$OUTPUT_DIR/wayback/${domain}_wayback.txt" 2>/dev/null | \
-        awk -F/ '{print $3}' | sort -u >> "$OUTPUT_DIR/subdomains_raw.txt"
-}
-
-while IFS= read -r domain; do
-    subdomain_enum "$domain" &
-done < "$DOMAINS_FILE"
-wait
-
-# Deduplicate subdomains
-sort -u "$OUTPUT_DIR/subdomains_raw.txt" > "$OUTPUT_DIR/subdomains.txt"
-rm "$OUTPUT_DIR/subdomains_raw.txt"
-
-print_success "Total subdomains: $(wc -l < $OUTPUT_DIR/subdomains.txt)"
-
-# Check alive subdomains
-print_info "Checking alive subdomains..."
-cat "$OUTPUT_DIR/subdomains.txt" | httpx -silent -threads $THREADS -o "$OUTPUT_DIR/alive_subdomains.txt"
-print_success "Alive subdomains: $(wc -l < $OUTPUT_DIR/alive_subdomains.txt)"
-
-#############################################
-# PHASE 4: SHODAN RECONNAISSANCE (if API key)
+# PHASE 5: SHODAN RECONNAISSANCE (if API key)
 #############################################
 if [ -n "$SHODAN_API_KEY" ]; then
-    print_status "\nPHASE 4: Shodan Reconnaissance"
+    print_status "\nPHASE 5: Shodan Reconnaissance"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     
     print_info "Searching Shodan for each domain..."
@@ -213,14 +228,14 @@ if [ -n "$SHODAN_API_KEY" ]; then
     
     print_success "Shodan results saved in $OUTPUT_DIR/shodan/"
 else
-    print_info "\n[!] PHASE 4: Shodan skipped (no API key)"
+    print_info "\n[!] PHASE 5: Shodan skipped (no API key)"
     print_info "    Set SHODAN_API_KEY environment variable to enable"
 fi
 
 #############################################
-# PHASE 5: URL CRAWLING & PARAMETER DISCOVERY
+# PHASE 6: URL CRAWLING & PARAMETER DISCOVERY
 #############################################
-print_status "\nPHASE 5: Deep URL Crawling"
+print_status "\nPHASE 6: Deep URL Crawling"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 print_info "Crawling with Katana..."
@@ -236,9 +251,9 @@ cat "$OUTPUT_DIR/wayback/all_wayback_urls.txt" \
 print_success "Total URLs collected: $(wc -l < $OUTPUT_DIR/all_urls.txt)"
 
 #############################################
-# PHASE 6: XSS HUNTING PIPELINE
+# PHASE 7: XSS HUNTING PIPELINE
 #############################################
-print_status "\nPHASE 6: XSS Vulnerability Hunting"
+print_status "\nPHASE 7: XSS Vulnerability Hunting"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 print_info "Filtering XSS candidates with GF..."
@@ -274,9 +289,9 @@ if [ -s "$OUTPUT_DIR/xss/reflected.txt" ]; then
 fi
 
 #############################################
-# PHASE 7: IDOR HUNTING PIPELINE
+# PHASE 8: IDOR HUNTING PIPELINE
 #############################################
-print_status "\nPHASE 7: IDOR Vulnerability Hunting"
+print_status "\nPHASE 8: IDOR Vulnerability Hunting"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 print_info "Filtering IDOR candidates..."
@@ -313,9 +328,9 @@ cat "$OUTPUT_DIR/idor/idor_unique.txt" | \
 print_success "API endpoints for Autorize: $(wc -l < $OUTPUT_DIR/idor/api_endpoints.txt)"
 
 #############################################
-# PHASE 8: SQL INJECTION DETECTION
+# PHASE 9: SQL INJECTION DETECTION
 #############################################
-print_status "\nPHASE 8: SQL Injection Detection"
+print_status "\nPHASE 9: SQL Injection Detection"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 print_info "Filtering SQLi candidates..."
@@ -330,9 +345,9 @@ head -50 "$OUTPUT_DIR/sqli/sqli_unique.txt" > "$OUTPUT_DIR/sqli/loxs_targets.txt
 print_info "Prepared $(wc -l < $OUTPUT_DIR/sqli/loxs_targets.txt) URLs for manual Loxs testing"
 
 #############################################
-# PHASE 9: NUCLEI VULNERABILITY SCANNING
+# PHASE 10: NUCLEI VULNERABILITY SCANNING
 #############################################
-print_status "\nPHASE 9: Nuclei Automated Scanning"
+print_status "\nPHASE 10: Nuclei Automated Scanning"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 print_info "Running Nuclei on alive subdomains..."
@@ -369,9 +384,9 @@ print_success "Nuclei CVEs: $(wc -l < $OUTPUT_DIR/nuclei/cves.txt 2>/dev/null ||
 print_success "Nuclei misconfigs: $(wc -l < $OUTPUT_DIR/nuclei/misconfigs.txt 2>/dev/null || echo 0)"
 
 #############################################
-# PHASE 10: SECRET SCANNING
+# PHASE 11: SECRET SCANNING
 #############################################
-print_status "\nPHASE 10: Secret & Token Discovery"
+print_status "\nPHASE 11: Secret & Token Discovery"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 print_info "Extracting JavaScript files..."
@@ -391,10 +406,10 @@ cat "$OUTPUT_DIR/secrets/js_files.txt" | \
 print_success "Secrets found in JS: $(wc -l < $OUTPUT_DIR/secrets/js_secrets.txt 2>/dev/null || echo 0)"
 
 #############################################
-# PHASE 11: VIRUSTOTAL INTEGRATION (if API key)
+# PHASE 12: VIRUSTOTAL INTEGRATION (if API key)
 #############################################
 if [ -n "$VT_API_KEY" ]; then
-    print_status "\nPHASE 11: VirusTotal Intelligence"
+    print_status "\nPHASE 12: VirusTotal Intelligence"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     
     vt_search() {
@@ -410,21 +425,22 @@ if [ -n "$VT_API_KEY" ]; then
     mkdir -p "$OUTPUT_DIR/virustotal"
     
     while IFS= read -r domain; do
-        vt_search "$domain" &
+        clean_domain=$(echo "$domain" | sed 's|https\?://||' | cut -d'/' -f1)
+        vt_search "$clean_domain" &
         sleep 1  # Rate limiting
     done < "$DOMAINS_FILE"
     wait
     
     print_success "VirusTotal results saved"
 else
-    print_info "\n[!] PHASE 11: VirusTotal skipped (no API key)"
+    print_info "\n[!] PHASE 12: VirusTotal skipped (no API key)"
     print_info "    Set VT_API_KEY environment variable to enable"
 fi
 
 #############################################
-# PHASE 12: GENERATE FINAL REPORT
+# PHASE 13: GENERATE FINAL REPORT
 #############################################
-print_status "\nPHASE 12: Generating Summary Report"
+print_status "\nPHASE 13: Generating Summary Report"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 REPORT_FILE="$OUTPUT_DIR/reports/SUMMARY_REPORT.txt"
@@ -434,14 +450,14 @@ cat > "$REPORT_FILE" << EOF
     BUG BOUNTY AUTOMATION REPORT
 ═══════════════════════════════════════════════════════════
 Generated: $(date)
-Domains Scanned: $(wc -l < $DOMAINS_FILE)
+Input Domains: $(wc -l < $DOMAINS_FILE)
 Output Directory: $OUTPUT_DIR
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RECONNAISSANCE SUMMARY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Total URLs Collected:     $(wc -l < $OUTPUT_DIR/all_urls.txt)
-Subdomains Found:         $(wc -l < $OUTPUT_DIR/subdomains.txt)
+All Subdomains Found:     $(wc -l < $OUTPUT_DIR/all_subdomains.txt)
 Alive Subdomains:         $(wc -l < $OUTPUT_DIR/alive_subdomains.txt)
 Wayback URLs:            $(wc -l < $OUTPUT_DIR/wayback/all_wayback_urls.txt)
 
@@ -497,7 +513,7 @@ NEXT STEPS - MANUAL TESTING REQUIRED
 ═══════════════════════════════════════════════════════════
 
 1. XSS Testing with Loxs:
-   cd ~/loxs && source venv/bin/activate
+   cd ~/Cyber/newtoys/loxs && source venv/bin/activate
    python3 loxs.py
    → Select XSS, use file: $OUTPUT_DIR/xss/loxs_targets.txt
 
@@ -507,7 +523,7 @@ NEXT STEPS - MANUAL TESTING REQUIRED
    → Test ID manipulation from: $OUTPUT_DIR/idor/numeric_ids.txt
 
 3. SQLi Testing with Loxs:
-   cd ~/loxs && source venv/bin/activate
+   cd ~/Cyber/newtoys/loxs && source venv/bin/activate
    python3 loxs.py
    → Select SQLi, use file: $OUTPUT_DIR/sqli/loxs_targets.txt
 
@@ -569,10 +585,10 @@ echo "Quick Commands for Manual Testing"
 echo "=================================="
 echo ""
 echo "1. Test XSS with Loxs:"
-echo "   cd ~/loxs && source venv/bin/activate && python3 loxs.py"
+echo "   cd ~/Cyber/newtoys/loxs && source venv/bin/activate && python3 loxs.py"
 echo ""
 echo "2. Test SQLi with Loxs:"
-echo "   cd ~/loxs && source venv/bin/activate && python3 loxs.py"
+echo "   cd ~/Cyber/newtoys/loxs && source venv/bin/activate && python3 loxs.py"
 echo ""
 echo "3. Check 404 files in Wayback:"
 echo "   cat secrets/404_check_archive.txt"
